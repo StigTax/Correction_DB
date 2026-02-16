@@ -521,10 +521,16 @@ class SchemaCorrector:
         src_inspector,
         table_name: str,
     ) -> list[Operation]:
-        """Планирует добавление FK для новой таблицы.
+        """Планирует добавление FK для новой таблицы через ALTER TABLE.
 
-        Используется для диалектов, где возможно добавлять FK через ALTER TABLE
-        (например, PostgreSQL). Для SQLite возвращает пустой список.
+        Используется в diff() только для таблиц, которых нет в target
+        (missing_tables), и только для диалектов, где внешние ключи можно
+        добавлять постфактум (например, PostgreSQL).
+
+        Для SQLite метод всегда возвращает пустой список, потому что SQLite
+        не умеет добавлять FK через ALTER TABLE; для SQLite FK должны быть
+        включены в CREATE TABLE (см. include_foreign_keys в
+        _plan_create_table()).
 
         Args:
             src_inspector: SQLAlchemy Inspector для source БД.
@@ -552,11 +558,17 @@ class SchemaCorrector:
     ) -> list[Operation]:
         """Планирует добавление отсутствующих FK для существующей таблицы.
 
-        Сравнивает список FK в source и target и формирует операции добавления
-        отсутствующих FK.
+        Используется в diff() для таблиц, которые присутствуют и в source, и в
+        target (common_tables).
 
-        Для SQLite добавление FK через ALTER TABLE не поддерживается, поэтому
-        возвращается report-операция.
+        Поведение зависит от диалекта:
+        - Для PostgreSQL и подобных: сравнивает FK в source и target и
+          возвращает операции добавления только недостающих FK
+          (ALTER TABLE ... ADD CONSTRAINT ...).
+        - Для SQLite: ALTER TABLE ADD CONSTRAINT не поддерживается.
+          Поэтому метод возвращает Operation(kind='report') только если в
+          target реально отсутствуют FK, которые есть в source.
+          Если различий нет — возвращает [].
 
         Args:
             table_name: Имя таблицы для сравнения.
@@ -608,11 +620,18 @@ class SchemaCorrector:
         src_fks: list[dict],
         tgt_fks: list[dict] | None = None,
     ) -> list[Operation]:
-        """Планирует операции добавления внешних ключей.
+        """Строит операции добавления FK на основе списка FK из инспектора.
 
-        - Если tgt_fks=None, планирует добавление всех FK из source
-          (новая таблица).
-        - Если tgt_fks передан, планирует добавление только отсутствующих FK.
+        Это низкоуровневый helper, который не обращается к БД напрямую: он
+        принимает уже извлечённые данные FK (src_fks/tgt_fks) и преобразует
+        их в операции.
+
+        Режим работы:
+        - Если tgt_fks is None: планирует добавление всех FK из src_fks
+          (сценарий "новая таблица").
+        - Если tgt_fks передан: планирует добавление только тех FK из src_fks,
+          сигнатуры которых отсутствуют в tgt_fks (сценарий "существующая
+          таблица").
 
         Args:
             table_name: Имя таблицы.
@@ -640,7 +659,19 @@ class SchemaCorrector:
         table_name: str,
         fk: dict
     ) -> Operation | None:
-        """Строит операцию добавления внешнего ключа по данным инспектора.
+        """Формирует SQL для добавления одного внешнего ключа.
+
+        На вход принимает словарь FK из Inspector.get_foreign_keys() и пытается
+        построить корректный SQL вида:
+        ALTER TABLE ... ADD CONSTRAINT ... FOREIGN KEY ... REFERENCES ...
+
+        Если данных недостаточно (например, нет referred_table или колонок),
+        возвращает None.
+
+        Особенности:
+        - Для PostgreSQL добавляет суффикс NOT VALID, чтобы не валидировать
+          constraint на больших данных автоматически
+          (безопаснее для "боевых" баз).
 
         Args:
             table_name: Имя таблицы, в которую добавляется FK.
