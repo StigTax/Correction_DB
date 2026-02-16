@@ -380,6 +380,8 @@ def test_plan_add_foreign_keys_for_new_table_sqlite_returns_empty(tmp_path):
     c = SchemaCorrector(source_url=src, target_url=tgt)
 
     fake_src_insp = Mock()
+    fake_src_insp.get_foreign_keys.return_value = []
+
     ops = c._plan_add_foreign_keys_for_new_table(fake_src_insp, 'orders')
     assert ops == []
 

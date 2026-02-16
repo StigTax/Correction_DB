@@ -536,18 +536,15 @@ class SchemaCorrector:
         if self._is_sqlite():
             return []
 
-        fks = src_inspector.get_foreign_keys(
+        src_fks = src_inspector.get_foreign_keys(
             table_name,
             schema=self.schema
         ) or []
-        ops: list[Operation] = []
-
-        for fk in fks:
-            op = self._build_fk_operation(table_name, fk)
-            if op is not None:
-                ops.append(op)
-
-        return ops
+        return self._plan_foreign_keys(
+            table_name=table_name,
+            src_fks=src_fks,
+            tgt_fks=None,
+        )
 
     def _plan_add_missing_foreign_keys(
         self,
@@ -575,34 +572,63 @@ class SchemaCorrector:
             schema=self.schema
         ) or []
 
-        if self._is_sqlite():
-            ops: list[Operation] = []
-            if src_fks:
-                ops.append(Operation(
-                    kind='report',
-                    sql='-- no-op',
-                    comment=(
-                        f'RISKY: SQLite cannot add FK via ALTER TABLE: '
-                        f'table={table_name}'
-                    ),
-                ))
-            return ops
-
         try:
             tgt_fks = tgt_inspector.get_foreign_keys(
                 table_name,
-                schema=self.schema,
+                schema=self.schema
             ) or []
         except Exception:
             tgt_fks = []
 
-        tgt_sigs = {self._fk_signature(fk) for fk in tgt_fks}
+        if self._is_sqlite():
+            src_sigs = {self._fk_signature(fk) for fk in src_fks}
+            tgt_sigs = {self._fk_signature(fk) for fk in tgt_fks}
+            missing = src_sigs - tgt_sigs
+            if not missing:
+                return []
+            return [Operation(
+                kind='report',
+                sql='-- no-op',
+                comment=(
+                    'RISKY: SQLite cannot add FK via ALTER TABLE: '
+                    f'table={table_name}, missing={len(missing)}'
+                ),
+            )]
+
+        return self._plan_foreign_keys(
+            table_name=table_name,
+            src_fks=src_fks,
+            tgt_fks=tgt_fks,
+        )
+
+    def _plan_foreign_keys(
+        self,
+        *,
+        table_name: str,
+        src_fks: list[dict],
+        tgt_fks: list[dict] | None = None,
+    ) -> list[Operation]:
+        """Планирует операции добавления внешних ключей.
+
+        - Если tgt_fks=None, планирует добавление всех FK из source
+          (новая таблица).
+        - Если tgt_fks передан, планирует добавление только отсутствующих FK.
+
+        Args:
+            table_name: Имя таблицы.
+            src_fks: FK из source (Inspector.get_foreign_keys()).
+            tgt_fks: FK из target или None.
+
+        Returns:
+            list[Operation]: Операции add_foreign_key.
+        """
+        tgt_sigs = {self._fk_signature(fk) for fk in (tgt_fks or [])}
         ops: list[Operation] = []
 
         for fk in src_fks:
-            if self._fk_signature(fk) in tgt_sigs:
+            sig = self._fk_signature(fk)
+            if tgt_fks is not None and sig in tgt_sigs:
                 continue
-
             op = self._build_fk_operation(table_name, fk)
             if op is not None:
                 ops.append(op)
