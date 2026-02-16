@@ -14,17 +14,17 @@ from sqlalchemy.schema import CreateIndex, CreateTable
 class Operation:
     """Описывает одну операцию синхронизации схемы.
 
-    Экземпляры этого класса используются как элементы плана миграции, который
-    возвращает `SchemaCorrector.diff()` и затем может быть применён методом
+    Экземпляры Operation формируют план изменений, который возвращает
+    `SchemaCorrector.diff()` и который может быть применён методом
     `SchemaCorrector.apply()`.
 
     Attributes:
-        kind: Тип операции. Возможные значения:
-            - 'create_table' — создание отсутствующей таблицы;
-            - 'add_column' — добавление отсутствующей колонки;
-            - 'create_index' — создание отсутствующего индекса;
-            - 'report' — отчёт о различиях,
-                которые не применяются автоматически.
+        kind: Тип операции. Поддерживаемые значения:
+            - create_table: создание отсутствующей таблицы;
+            - add_column: добавление отсутствующей колонки;
+            - create_index: создание отсутствующего индекса;
+            - add_foreign_key: добавление отсутствующего внешнего ключа;
+            - report: отчёт о различиях, которые не применяются автоматически.
         sql: SQL-код операции. Для kind='report' обычно содержит '-- no-op'.
         comment: Человеко-читаемое описание операции.
     """
@@ -45,16 +45,16 @@ class SchemaCorrector:
     Args:
         source_url: DSN эталонной БД (БД №1).
         target_url: DSN корректируемой БД (БД №2).
-        schema: Имя схемы (например, 'public'). Если None — используется
-            схема по умолчанию для выбранной СУБД.
+        schema: Имя схемы (например, 'public'). Если None — используется схема
+            по умолчанию для выбранной СУБД.
         lock_timeout_seconds: Таймаут ожидания блокировок (секунды).
             Применяется только для PostgreSQL.
         statement_timeout_seconds: Таймаут выполнения запросов (секунды).
-            0 означает отсутствие таймаута. Применяется только для PostgreSQL.
-        allow_destructive: Флаг для потенциально деструктивных операций.
-            В текущей реализации используется как настройка, но сами
-            деструктивные операции не выполняются автоматически.
-        logger: Логгер. Если не передан — используется logger по имени класса.
+            Значение 0 отключает таймаут. Применяется только для PostgreSQL.
+        allow_destructive: Флаг потенциально деструктивных операций. В текущей
+            реализации используется как настройка, но деструктивные операции
+            автоматически не выполняются.
+        logger: Логгер. Если не передан — используется логгер по имени класса.
     """
 
     def __init__(
@@ -103,14 +103,15 @@ class SchemaCorrector:
     def diff(self) -> list[Operation]:
         """Строит план синхронизации схемы целевой БД по эталону.
 
-        Метод сравнивает схемы source и target и возвращает список операций:
         - создание отсутствующих таблиц;
         - добавление отсутствующих колонок;
         - создание отсутствующих индексов;
-        - отчёты о лишних сущностях в target и рискованных различиях.
+        - добавление отсутствующих внешних ключей (FK);
+        - отчёты о лишних сущностях в target и рискованных расхождениях.
 
         Важно: рискованные различия (тип/nullable)
-            не применяются автоматически.
+            не применяются автоматически и возвращаются как
+            Operation(kind='report').
 
         Returns:
             list[Operation]: Список операций для синхронизации (план).
@@ -147,6 +148,10 @@ class SchemaCorrector:
             )
 
         missing_tables = sorted(src_tables - tgt_tables)
+        missing_tables = self._sort_missing_tables_by_fk(
+            src_inspector,
+            missing_tables
+        )
         if missing_tables:
             self.logger.info(
                 'Missing tables in target: %d',
@@ -154,7 +159,15 @@ class SchemaCorrector:
             )
         for table_name in missing_tables:
             self.logger.info('Planning create table: %s', table_name)
-            ops.extend(self._plan_create_table(table_name))
+            include_fk = self._is_sqlite()
+
+            ops.extend(
+                self._plan_create_table(
+                    table_name,
+                    include_foreign_keys=include_fk,
+                )
+            )
+
             idx_ops = self._plan_add_missing_indexes(table_name)
             if idx_ops:
                 self.logger.info(
@@ -191,6 +204,21 @@ class SchemaCorrector:
                     len(idx_ops),
                 )
             ops.extend(idx_ops)
+
+        fk_ops: list[Operation] = []
+        if not self._is_sqlite():
+            for table_name in missing_tables:
+                fk_ops.extend(self._plan_add_foreign_keys_for_new_table(
+                    src_inspector,
+                    table_name,
+                ))
+
+        for table_name in common_tables:
+            fk_ops.extend(self._plan_add_missing_foreign_keys(table_name))
+
+        if fk_ops:
+            self.logger.info('Planned foreign keys: %d', len(fk_ops))
+        ops.extend(fk_ops)
 
         risky_count = 0
         for table_name in common_tables:
@@ -265,7 +293,65 @@ class SchemaCorrector:
             self.logger.critical('Schema correction aborted due to error.')
             raise
 
-    def _plan_create_table(self, table_name: str) -> list[Operation]:
+    def _sort_missing_tables_by_fk(
+        self,
+        src_inspector,
+        missing: list[str]
+    ) -> list[str]:
+        """Сортирует список недостающих таблиц с учётом зависимостей FK.
+
+        Метод пытается упорядочить создание таблиц так,
+        чтобы таблицы-«родители» создавались раньше таблиц-«потомков»,
+        которые ссылаются на них через FK. Если обнаружен цикл зависимостей,
+        возвращает исходный порядок и логирует
+        предупреждение.
+
+        Args:
+            src_inspector: SQLAlchemy Inspector для source БД.
+            missing: Список таблиц, отсутствующих в target.
+
+        Returns:
+            list[str]: Таблицы в порядке, безопасном для создания
+            (насколько возможно).
+        """
+        missing_set = set(missing)
+        deps: dict[str, set[str]] = {t: set() for t in missing}
+
+        for t in missing:
+            for fk in src_inspector.get_foreign_keys(
+                t,
+                schema=self.schema
+            ) or []:
+                rt = fk.get('referred_table')
+                if rt and rt in missing_set:
+                    deps[t].add(rt)
+
+        ready = [t for t in missing if not deps[t]]
+        out: list[str] = []
+
+        while ready:
+            n = ready.pop()
+            out.append(n)
+            for t in missing:
+                if n in deps[t]:
+                    deps[t].remove(n)
+                    if not deps[t] and t not in out and t not in ready:
+                        ready.append(t)
+
+        if len(out) != len(missing):
+            self.logger.warning(
+                'RISKY: cycle detected in FK dependencies, '
+                'using fallback order'
+            )
+            return missing
+        return out
+
+    def _plan_create_table(
+        self,
+        table_name: str,
+        *,
+        include_foreign_keys: bool,
+    ) -> list[Operation]:
         """Формирует операцию создания отсутствующей таблицы.
 
         Таблица отражается (autoload) из source и затем генерируется DDL
@@ -273,6 +359,9 @@ class SchemaCorrector:
 
         Args:
             table_name: Имя таблицы, которую нужно создать в target.
+            include_foreign_keys: Если True — включает FK в CREATE TABLE.
+                Если False — исключает FK из CREATE TABLE
+                (для последующего добавления через ALTER).
 
         Returns:
             list[Operation]: Список операций
@@ -281,8 +370,12 @@ class SchemaCorrector:
         md = MetaData(schema=self.schema)
         table = Table(table_name, md, autoload_with=self.source_engine)
 
+        fk_constraints = None if include_foreign_keys else frozenset()
         ddl = str(
-            CreateTable(table).compile(self.target_engine)
+            CreateTable(
+                table,
+                include_foreign_key_constraints=fk_constraints,
+            ).compile(self.target_engine)
         ).rstrip() + ';'
         return [
             Operation(
@@ -358,12 +451,19 @@ class SchemaCorrector:
             )
         except Exception:
             tgt_indexes = []
-        tgt_index_names = {i.get('name') for i in tgt_indexes if i.get('name')}
+
+        tgt_index_names = {
+            i.get('name') for i in tgt_indexes if i.get('name')
+        }
 
         ops: list[Operation] = []
 
         md = MetaData(schema=self.schema)
-        src_table = Table(table_name, md, autoload_with=self.source_engine)
+        src_table = Table(
+            table_name,
+            md,
+            autoload_with=self.source_engine
+        )
 
         for idx in src_table.indexes:
             if idx.name and idx.name not in tgt_index_names:
@@ -379,7 +479,6 @@ class SchemaCorrector:
                 )
 
         prefix = 'Create index '
-
         planned_names = {
             op.comment.removeprefix(prefix)
             for op in ops
@@ -416,6 +515,178 @@ class SchemaCorrector:
                 )
             )
         return ops
+
+    def _plan_add_foreign_keys_for_new_table(
+        self,
+        src_inspector,
+        table_name: str,
+    ) -> list[Operation]:
+        """Планирует добавление FK для новой таблицы.
+
+        Используется для диалектов, где возможно добавлять FK через ALTER TABLE
+        (например, PostgreSQL). Для SQLite возвращает пустой список.
+
+        Args:
+            src_inspector: SQLAlchemy Inspector для source БД.
+            table_name: Имя таблицы, для которой нужно добавить FK.
+
+        Returns:
+            list[Operation]: Операции add_foreign_key.
+        """
+        if self._is_sqlite():
+            return []
+
+        fks = src_inspector.get_foreign_keys(
+            table_name,
+            schema=self.schema
+        ) or []
+        ops: list[Operation] = []
+
+        for fk in fks:
+            op = self._build_fk_operation(table_name, fk)
+            if op is not None:
+                ops.append(op)
+
+        return ops
+
+    def _plan_add_missing_foreign_keys(
+        self,
+        table_name: str
+    ) -> list[Operation]:
+        """Планирует добавление отсутствующих FK для существующей таблицы.
+
+        Сравнивает список FK в source и target и формирует операции добавления
+        отсутствующих FK.
+
+        Для SQLite добавление FK через ALTER TABLE не поддерживается, поэтому
+        возвращается report-операция.
+
+        Args:
+            table_name: Имя таблицы для сравнения.
+
+        Returns:
+            list[Operation]: Операции add_foreign_key или report.
+        """
+        src_inspector = inspect(self.source_engine)
+        tgt_inspector = inspect(self.target_engine)
+
+        src_fks = src_inspector.get_foreign_keys(
+            table_name,
+            schema=self.schema
+        ) or []
+
+        if self._is_sqlite():
+            ops: list[Operation] = []
+            if src_fks:
+                ops.append(Operation(
+                    kind='report',
+                    sql='-- no-op',
+                    comment=(
+                        f'RISKY: SQLite cannot add FK via ALTER TABLE: '
+                        f'table={table_name}'
+                    ),
+                ))
+            return ops
+
+        try:
+            tgt_fks = tgt_inspector.get_foreign_keys(
+                table_name,
+                schema=self.schema,
+            ) or []
+        except Exception:
+            tgt_fks = []
+
+        tgt_sigs = {self._fk_signature(fk) for fk in tgt_fks}
+        ops: list[Operation] = []
+
+        for fk in src_fks:
+            if self._fk_signature(fk) in tgt_sigs:
+                continue
+
+            op = self._build_fk_operation(table_name, fk)
+            if op is not None:
+                ops.append(op)
+
+        return ops
+
+    def _build_fk_operation(
+        self,
+        table_name: str,
+        fk: dict
+    ) -> Operation | None:
+        """Строит операцию добавления внешнего ключа по данным инспектора.
+
+        Args:
+            table_name: Имя таблицы, в которую добавляется FK.
+            fk: Словарь с описанием FK из Inspector.get_foreign_keys().
+
+        Returns:
+            Operation | None: Operation(kind='add_foreign_key') или None, если
+            недостаточно данных для построения корректного SQL.
+        """
+        ref_table = fk.get('referred_table')
+        if not ref_table:
+            return None
+
+        name = fk.get('name') or self._make_fk_name(table_name, fk)
+
+        cols = fk.get('constrained_columns') or []
+        ref_cols = fk.get('referred_columns') or []
+        ref_schema = fk.get('referred_schema') or self.schema
+
+        if not cols or not ref_cols:
+            return None
+
+        cols_sql = ', '.join(self._q(c) for c in cols)
+        ref_cols_sql = ', '.join(self._q(c) for c in ref_cols)
+
+        if ref_schema:
+            ref_table_sql = f'{self._q(ref_schema)}.{self._q(ref_table)}'
+        else:
+            ref_table_sql = self._q(ref_table)
+
+        sql = (
+            f'ALTER TABLE {self._qt(table_name)} '
+            f'ADD CONSTRAINT {self._q(name)} '
+            f'FOREIGN KEY ({cols_sql}) '
+            f'REFERENCES {ref_table_sql} ({ref_cols_sql})'
+        )
+
+        opts = fk.get('options') or {}
+        if opts.get('ondelete'):
+            sql += f' ON DELETE {opts["ondelete"]}'
+        if opts.get('onupdate'):
+            sql += f' ON UPDATE {opts["onupdate"]}'
+
+        if self.target_engine.dialect.name == 'postgresql':
+            sql += ' NOT VALID'
+
+        sql += ';'
+
+        return Operation(
+            kind='add_foreign_key',
+            sql=sql,
+            comment=f'Add foreign key {table_name}.{name}',
+        )
+
+    def _fk_signature(self, fk: dict) -> tuple:
+        """Возвращает сигнатуру FK для сравнения source vs target."""
+        opts = fk.get('options') or {}
+        return (
+            tuple(fk.get('constrained_columns') or []),
+            fk.get('referred_schema') or self.schema,
+            fk.get('referred_table'),
+            tuple(fk.get('referred_columns') or []),
+            opts.get('ondelete'),
+            opts.get('onupdate'),
+        )
+
+    def _make_fk_name(self, table_name: str, fk: dict) -> str:
+        """Генерирует детерминированное имя FK (если инспектор не дал name)."""
+        cols = '_'.join(fk.get('constrained_columns') or [])
+        ref = fk.get('referred_table') or 'ref'
+        name = f'fk_{table_name}_{cols}_{ref}'
+        return name[:60]
 
     def _report_extra_columns(self, table_name: str) -> list[Operation]:
         """Формирует отчёт по “лишним” колонкам, которые есть только в target.
@@ -507,7 +778,7 @@ class SchemaCorrector:
         insp = inspect(engine)
         cols = insp.get_columns(table_name, schema=self.schema)
 
-        out = {}
+        out: dict[str, dict[str, object]] = {}
         for c in cols:
             type_sql = c['type'].compile(dialect=engine.dialect)
             out[c['name']] = {
@@ -573,3 +844,7 @@ class SchemaCorrector:
         if self.schema:
             return f'{self._q(self.schema)}.{self._q(table_name)}'
         return self._q(table_name)
+
+    def _is_sqlite(self) -> bool:
+        """Возвращает True, если target-диалект SQLite."""
+        return self.target_engine.dialect.name == 'sqlite'

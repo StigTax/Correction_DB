@@ -229,21 +229,27 @@ def test_apply_executes_safe_ops_and_preserves_data_constraints(prepared_dbs):
 
     indexes = inspect(tgt_engine).get_indexes('users')
     order_indexes = inspect(tgt_engine).get_indexes('orders')
+    order_fks = inspect(tgt_engine).get_foreign_keys('orders')
 
     assert 'orders' in _reflect_tables(tgt_engine)
 
     assert 'age' in _reflect_columns(tgt_engine, 'users')
+
+    assert any(
+        fk.get('referred_table') == 'users'
+        and fk.get('constrained_columns') == ['user_id']
+        and fk.get('referred_columns') == ['id']
+        for fk in order_fks
+    )
 
     assert _is_nullable(tgt_engine, 'users', 'email') is True
 
     assert any(i.get('name') == 'ix_users_email' for i in indexes)
     assert any(i.get('name') == 'ix_orders_user_id' for i in order_indexes)
 
-    # Лишняя таблица и колонка никуда не делись
     assert 'notes' in _reflect_tables(tgt_engine)
     assert 'legacy' in _reflect_columns(tgt_engine, 'users')
 
-    # Данные не повреждены
     assert _count_rows(tgt_engine, 'notes') == 1
     assert _get_user_legacy(tgt_engine, 1) == 'keep-me'
 

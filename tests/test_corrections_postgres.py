@@ -79,6 +79,7 @@ def test_diff_plans_expected_ops_and_reports(prepared_postgres_dbs, caplog):
     kinds = {op.kind for op in ops}
     assert 'create_table' in kinds
     assert 'add_column' in kinds
+    assert 'add_foreign_key' in kinds
     assert 'report' in kinds
 
     assert any(
@@ -155,7 +156,16 @@ def test_apply_executes_safe_ops_and_preserves_data(prepared_postgres_dbs):
     assert 'orders' in _reflect_tables(tgt_engine, schema)
     assert 'age' in _reflect_columns(tgt_engine, schema, 'users')
 
+    order_fks = inspect(tgt_engine).get_foreign_keys('orders', schema=schema)
+
     assert _is_nullable(tgt_engine, schema, 'users', 'email') is True
+
+    assert any(
+        fk.get('referred_table') == 'users'
+        and fk.get('constrained_columns') == ['user_id']
+        and fk.get('referred_columns') == ['id']
+        for fk in order_fks
+    )
 
     user_indexes = inspect(tgt_engine).get_indexes('users', schema=schema)
     order_indexes = inspect(tgt_engine).get_indexes('orders', schema=schema)

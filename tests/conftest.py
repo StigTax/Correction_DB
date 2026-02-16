@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 from sqlalchemy import (
     Column,
+    ForeignKey,
     Index,
     Integer,
     MetaData,
@@ -57,7 +58,12 @@ def _create_source_schema(engine, *, schema: str | None = None) -> None:
         'orders',
         md,
         Column('id', Integer, primary_key=True),
-        Column('user_id', Integer, nullable=False),
+        Column(
+            'user_id',
+            Integer,
+            ForeignKey('users.id'),
+            nullable=False,
+        ),
         Column('total', Integer, nullable=False),
     )
     Index('ix_orders_user_id', orders.c.user_id)
