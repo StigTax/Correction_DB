@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from collections import defaultdict
 from dataclasses import dataclass
 from typing import Iterable, Optional
 
@@ -385,7 +386,10 @@ class SchemaCorrector:
             )
         ]
 
-    def _plan_add_missing_columns(self, table_name: str) -> list[Operation]:
+    def _plan_add_missing_columns(
+        self,
+        table_name: str
+    ) -> list[Operation]:
         """Планирует добавление колонок, отсутствующих в target.
 
         Метод сравнивает набор колонок source и target в рамках одной таблицы и
@@ -426,7 +430,10 @@ class SchemaCorrector:
 
         return ops
 
-    def _plan_add_missing_indexes(self, table_name: str) -> list[Operation]:
+    def _plan_add_missing_indexes(
+        self,
+        table_name: str
+    ) -> list[Operation]:
         """Планирует создание индексов, отсутствующих в target.
 
         Алгоритм:
@@ -523,18 +530,17 @@ class SchemaCorrector:
     ) -> list[Operation]:
         """Планирует добавление FK для новой таблицы через ALTER TABLE.
 
-        Используется в diff() только для таблиц, которых нет в target
+        Этот метод используется в diff() только для таблиц, которых нет в target
         (missing_tables), и только для диалектов, где внешние ключи можно
         добавлять постфактум (например, PostgreSQL).
 
         Для SQLite метод всегда возвращает пустой список, потому что SQLite
-        не умеет добавлять FK через ALTER TABLE; для SQLite FK должны быть
-        включены в CREATE TABLE (см. include_foreign_keys в
-        _plan_create_table()).
+        не поддерживает добавление FK через ALTER TABLE. В SQLite FK должны быть
+        включены в CREATE TABLE (см. include_foreign_keys в _plan_create_table()).
 
         Args:
-            src_inspector: SQLAlchemy Inspector для source БД.
-            table_name: Имя таблицы, для которой нужно добавить FK.
+            src_inspector: Inspector для source БД.
+            table_name: Имя таблицы, для которой планируются FK.
 
         Returns:
             list[Operation]: Операции add_foreign_key.
@@ -558,7 +564,7 @@ class SchemaCorrector:
     ) -> list[Operation]:
         """Планирует добавление отсутствующих FK для существующей таблицы.
 
-        Используется в diff() для таблиц, которые присутствуют и в source, и в
+уч        Используется в diff() для таблиц, которые присутствуют и в source, и в
         target (common_tables).
 
         Поведение зависит от диалекта:
@@ -566,9 +572,9 @@ class SchemaCorrector:
           возвращает операции добавления только недостающих FK
           (ALTER TABLE ... ADD CONSTRAINT ...).
         - Для SQLite: ALTER TABLE ADD CONSTRAINT не поддерживается.
-          Поэтому метод возвращает Operation(kind='report') только если в
-          target реально отсутствуют FK, которые есть в source.
-          Если различий нет — возвращает [].
+          Поэтому метод возвращает Operation(kind='report') только если в target
+          реально отсутствуют FK, которые есть в source. Если различий нет —
+          возвращает пустой список.
 
         Args:
             table_name: Имя таблицы для сравнения.
@@ -644,15 +650,67 @@ class SchemaCorrector:
         tgt_sigs = {self._fk_signature(fk) for fk in (tgt_fks or [])}
         ops: list[Operation] = []
 
+        tgt_by_cols: dict[tuple[str, ...], list[dict]] = defaultdict(list)
+        if tgt_fks is not None:
+            for fk in tgt_fks:
+                key = self._fk_cols_key(fk)
+                if key:
+                    tgt_by_cols[key].append(fk)
+
+        def _fmt_ref(fk: dict) -> str:
+            ref_table = fk.get('referred_table')
+            if not ref_table:
+                return '<unknown>'
+            ref_schema = fk.get('referred_schema') or self.schema
+            ref_cols = ','.join(fk.get('referred_columns') or [])
+            if ref_schema:
+                return f'{ref_schema}.{ref_table}({ref_cols})'
+            return f'{ref_table}({ref_cols})'
+
+        def _fmt_cols(key: tuple[str, ...]) -> str:
+            return ','.join(key) if key else '<unknown>'
+
         for fk in src_fks:
             sig = self._fk_signature(fk)
-            if tgt_fks is not None and sig in tgt_sigs:
-                continue
+            if tgt_fks is not None:
+                if sig in tgt_sigs:
+                    continue
+
+                key = self._fk_cols_key(fk)
+                if key and key in tgt_by_cols:
+                    tgt_refs = ', '.join(_fmt_ref(t) for t in tgt_by_cols[key])
+                    msg = (
+                        'RISKY: FK conflict on columns '
+                        f'{table_name}.{_fmt_cols(key)}: '
+                        f'source expects {_fmt_ref(fk)}, '
+                        f'target has {tgt_refs}'
+                    )
+                    ops.append(Operation(
+                        kind='report',
+                        sql='-- no-op',
+                        comment=msg
+                    ))
+                    continue
             op = self._build_fk_operation(table_name, fk)
             if op is not None:
                 ops.append(op)
 
         return ops
+
+    def _fk_cols_key(self, fk: dict) -> tuple[str, ...]:
+        """Возвращает ключ внешнего ключа по constrained_columns.
+
+        Используется для выявления конфликтов вида:
+        - в target уже есть FK на эти же колонки,
+          но он указывает на другую таблицу/колонки.
+
+        Args:
+            fk: Описание FK из Inspector.get_foreign_keys().
+
+        Returns:
+            tuple[str, ...]: constrained_columns или пустой tuple.
+        """
+        return tuple(fk.get('constrained_columns') or [])
 
     def _build_fk_operation(
         self,
@@ -726,7 +784,10 @@ class SchemaCorrector:
             comment=f'Add foreign key {table_name}.{name}',
         )
 
-    def _fk_signature(self, fk: dict) -> tuple:
+    def _fk_signature(
+        self,
+        fk: dict
+    ) -> tuple:
         """Возвращает сигнатуру FK для сравнения source vs target."""
         opts = fk.get('options') or {}
         return (
@@ -738,14 +799,21 @@ class SchemaCorrector:
             opts.get('onupdate'),
         )
 
-    def _make_fk_name(self, table_name: str, fk: dict) -> str:
+    def _make_fk_name(
+        self,
+        table_name: str,
+        fk: dict
+    ) -> str:
         """Генерирует детерминированное имя FK (если инспектор не дал name)."""
         cols = '_'.join(fk.get('constrained_columns') or [])
         ref = fk.get('referred_table') or 'ref'
         name = f'fk_{table_name}_{cols}_{ref}'
         return name[:60]
 
-    def _report_extra_columns(self, table_name: str) -> list[Operation]:
+    def _report_extra_columns(
+        self,
+        table_name: str
+    ) -> list[Operation]:
         """Формирует отчёт по “лишним” колонкам, которые есть только в target.
 
         Лишние колонки не удаляются автоматически, так как это может повредить
@@ -769,7 +837,10 @@ class SchemaCorrector:
             ops.append(Operation(kind='report', sql='-- no-op', comment=msg))
         return ops
 
-    def _report_risky_differences(self, table_name: str) -> list[Operation]:
+    def _report_risky_differences(
+        self,
+        table_name: str
+    ) -> list[Operation]:
         """Формирует отчёт по рискованным различиям между source и target.
 
         К рискованным различиям относятся изменения, которые потенциально могут
@@ -816,7 +887,11 @@ class SchemaCorrector:
 
         return ops
 
-    def _get_columns(self, engine: Engine, table_name: str) -> dict:
+    def _get_columns(
+        self,
+        engine: Engine,
+        table_name: str
+    ) -> dict:
         """Возвращает метаданные колонок таблицы.
 
         Использует SQLAlchemy Inspector для получения списка колонок и приводит
@@ -845,7 +920,10 @@ class SchemaCorrector:
             }
         return out
 
-    def _apply_timeouts(self, conn) -> None:
+    def _apply_timeouts(
+        self,
+        conn
+    ) -> None:
         """Устанавливает таймауты для транзакции (только PostgreSQL).
 
         В текущей реализации поддерживается только PostgreSQL, т.к. параметры
@@ -870,7 +948,10 @@ class SchemaCorrector:
             )
             conn.execute(text(stmt_sql))
 
-    def _q(self, name: str) -> str:
+    def _q(
+        self,
+        name: str
+    ) -> str:
         """Квотит идентификатор с учётом диалекта целевой СУБД.
 
         Используется для безопасного quoting имён таблиц/колонок/индексов
@@ -886,7 +967,10 @@ class SchemaCorrector:
             name
         )
 
-    def _qt(self, table_name: str) -> str:
+    def _qt(
+        self,
+        table_name: str
+    ) -> str:
         """Возвращает квотированное имя таблицы с учётом схемы.
 
         Если schema задана, результат будет вида: "<schema>"."<table>".

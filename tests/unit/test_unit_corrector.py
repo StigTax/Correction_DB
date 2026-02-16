@@ -508,3 +508,74 @@ def test_build_fk_operation_without_schema_uses_unqualified_reference(
     assert op is not None
     assert 'REFERENCES "users" ("id")' in op.sql
     assert '."users"' not in op.sql
+
+
+def test_plan_add_missing_foreign_keys_reports_conflict_and_skips_add(
+    monkeypatch,
+    tmp_path,
+):
+    """
+    Проверяет: FK-конфликт -> report, без add_foreign_key для конфликтного FK.
+    """
+    src = f'sqlite:///{tmp_path / "s.db"}'
+    tgt = f'sqlite:///{tmp_path / "t.db"}'
+
+    c = SchemaCorrector(source_url=src, target_url=tgt, schema='corr_fk_demo')
+    c._is_sqlite = lambda: False
+
+    class FakeSourceInspector:
+        def get_foreign_keys(self, table_name: str, schema=None):
+            assert table_name == 'orders'
+            return [
+                {
+                    'name': None,
+                    'referred_table': 'customers',
+                    'referred_schema': 'corr_fk_demo',
+                    'constrained_columns': ['user_id'],
+                    'referred_columns': ['id'],
+                    'options': {},
+                },
+                {
+                    'name': None,
+                    'referred_table': 'users',
+                    'referred_schema': 'corr_fk_demo',
+                    'constrained_columns': ['creator_id'],
+                    'referred_columns': ['id'],
+                    'options': {},
+                },
+            ]
+
+    class FakeTargetInspector:
+        def get_foreign_keys(self, table_name: str, schema=None):
+            assert table_name == 'orders'
+            return [
+                {
+                    'name': 'orders_user_id_fkey',
+                    'referred_table': 'users',
+                    'referred_schema': 'corr_fk_demo',
+                    'constrained_columns': ['user_id'],
+                    'referred_columns': ['id'],
+                    'options': {},
+                },
+            ]
+
+    def fake_inspect(engine):
+        if engine is c.source_engine:
+            return FakeSourceInspector()
+        if engine is c.target_engine:
+            return FakeTargetInspector()
+        raise AssertionError('unexpected engine')
+
+    monkeypatch.setattr(corrector_mod, 'inspect', fake_inspect)
+
+    ops = c._plan_add_missing_foreign_keys('orders')
+
+    assert any(
+        op.kind == 'report' and 'FK conflict' in op.comment for op in ops
+    )
+    assert not any(
+        op.kind == 'add_foreign_key' and 'customers' in op.sql for op in ops
+    )
+    assert any(
+        op.kind == 'add_foreign_key' and 'creator_id' in op.sql for op in ops
+    )
